@@ -26,6 +26,7 @@ Guards (all hosted, x402 pay-per-call):
   - agent-state-guard     -> pre-action reliability gate
   - memory-exfil-guard    -> data-leak / exfil screen
   - rate-limit-guard      -> amount/velocity anomaly check
+  - action-receipt        -> signed, replayable post-settlement receipt (offline-verifiable)
 """
 
 from __future__ import annotations
@@ -50,6 +51,36 @@ GUARD_ROUTES: dict[str, str] = {
     "external_write": "memory-exfil-guard",              # data-leak / exfil screen
     "value_transfer": "rate-limit-guard",                # amount/velocity anomaly check
 }
+
+
+def emit_receipt(action: Action, observation: Observation) -> dict | None:
+    """After a gated action is allowed + settled, mint a signed action-receipt.
+
+    This is the post-settlement accountability layer impeachmentright / giskard09
+    called for: a machine-checkable, replayable record of who did what, bound to the
+    action tuple + observer verdict. Verifiable offline against our published key,
+    so a downstream agent or auditor can trust the handoff without our service.
+    """
+    if not observation.allowed:
+        return None
+    url = f"{VIBES_ORIGIN}/api/v1/outcomes/action-receipt"
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "agent_id": action.payload.get("agent_id", "observer-agent"),
+                "action": action.intent,
+                "payload_digest": action.payload.get("payload_digest")
+                or str(hash(str(action.payload))),
+                "observer_verdict": "allow" if observation.allowed else "block",
+                "scope": observation.guard or "observer",
+            },
+            headers={"X-Ag402-Sandbox-Key": AG402_SANDBOX_KEY} if AG402_SANDBOX_KEY else {},
+            timeout=20.0,
+        )
+        return resp.json()
+    except Exception:
+        return None
 
 
 @dataclass
@@ -110,13 +141,17 @@ class VibesObserver:
         )
 
     def run(self, action: Action) -> Any:
-        """Observe, and only execute the action if guards allow it."""
+        """Observe, and only execute the action if guards allow it.
+        On success, mints a signed action-receipt for post-settlement accountability.
+        """
         obs = self.observe(action)
         if not obs.allowed:
             raise PermissionError(f"[VibesObserver] blocked '{action.intent}': {obs.reason}")
-        if action.execute is None:
-            return obs  # dry-run: just the observation
-        return action.execute()
+        result = action.execute() if action.execute else obs
+        receipt = emit_receipt(action, obs)
+        if receipt:
+            print(f"[RECEIPT] {receipt.get('receipt_id')} (verify: {receipt.get('verify_endpoint')})")
+        return result
 
     def close(self) -> None:
         self._client.close()
