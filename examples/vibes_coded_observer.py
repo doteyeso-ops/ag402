@@ -31,7 +31,9 @@ Guards (all hosted, x402 pay-per-call):
 
 from __future__ import annotations
 
+import hashlib
 import os
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -63,6 +65,9 @@ def emit_receipt(action: Action, observation: Observation) -> dict | None:
     """
     if not observation.allowed:
         return None
+    payload_digest = action.payload.get("payload_digest") or hashlib.sha256(
+        repr(sorted(action.payload.items())).encode()
+    ).hexdigest()
     url = f"{VIBES_ORIGIN}/api/v1/outcomes/action-receipt"
     try:
         resp = httpx.post(
@@ -70,10 +75,9 @@ def emit_receipt(action: Action, observation: Observation) -> dict | None:
             json={
                 "agent_id": action.payload.get("agent_id", "observer-agent"),
                 "action": action.intent,
-                "payload_digest": action.payload.get("payload_digest")
-                or str(hash(str(action.payload))),
-                "observer_verdict": "allow" if observation.allowed else "block",
-                "scope": observation.guard or "observer",
+                "payload_digest": payload_digest,
+                "nonce": uuid.uuid4().hex,          # unique per action -> replay-safe
+                "quote": observation.guard,          # the guard that approved it
             },
             headers={"X-Ag402-Sandbox-Key": AG402_SANDBOX_KEY} if AG402_SANDBOX_KEY else {},
             timeout=20.0,
